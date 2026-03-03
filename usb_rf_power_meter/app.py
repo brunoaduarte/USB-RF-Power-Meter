@@ -4,10 +4,13 @@ import platform
 import queue
 import subprocess
 import tkinter as tk
-from tkinter import messagebox, ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 from dataclasses import dataclass
 from math import ceil
+from typing import Callable
 
+from PIL import Image, ImageDraw, ImageFont
 from serial.tools import list_ports
 
 from usb_rf_power_meter.protocol import Measurement, SyncEntry
@@ -33,6 +36,8 @@ IGNORED_PORTS = {
     "/dev/cu.debug-console",
     "/dev/cu.wlan-debug",
 }
+CHART_FILE_EXTENSION = ".csv"
+EXPORT_FILE_EXTENSION = ".jpg"
 
 
 @dataclass(frozen=True)
@@ -114,11 +119,17 @@ def format_microwatts(value: float) -> str:
     return f"{value:.2f}".replace(".", ",") + "uW"
 
 
+def dbm_to_microwatts(dbm_value: float) -> float:
+    return 10 ** (dbm_value / 10.0) * 1000.0
+
+
 class SignalChart(ttk.Frame):
     def __init__(self, master: tk.Misc, palette: AppPalette) -> None:
         super().__init__(master)
         self._palette = palette
         self._samples: list[float] = []
+        self._hover_y: float | None = None
+        self._hover_x: float | None = None
         self._axis_width = 54
         self._top_padding = 18
         self._bottom_padding = 30
@@ -149,6 +160,8 @@ class SignalChart(ttk.Frame):
         )
         self._plot_canvas.grid(row=0, column=1, sticky="nsew")
         self._plot_canvas.bind("<Configure>", self._on_plot_resize)
+        self._plot_canvas.bind("<Motion>", self._on_plot_hover)
+        self._plot_canvas.bind("<Leave>", self._hide_hover_value)
 
         self._scrollbar = ttk.Scrollbar(self, orient="horizontal", command=self._plot_canvas.xview)
         self._scrollbar.grid(row=1, column=1, sticky="ew")
@@ -181,6 +194,20 @@ class SignalChart(ttk.Frame):
         self._point_spacing = self._base_point_spacing
         self._zoom_mode = "base"
         self._redraw()
+
+    def set_samples(self, dbm_values: list[float]) -> None:
+        self._samples = list(dbm_values)
+        self._point_spacing = self._base_point_spacing
+        self._zoom_mode = "base"
+        self._redraw()
+
+    def samples(self) -> list[float]:
+        return list(self._samples)
+
+    def export_to_jpeg(self, destination: Path) -> None:
+        export_width = CHART_WIDTH
+        export_spacing = self._export_fit_spacing(export_width)
+        self._render_chart_image(export_width, export_spacing).save(destination, format="JPEG", quality=95)
 
     def has_samples(self) -> bool:
         return bool(self._samples)
@@ -221,6 +248,93 @@ class SignalChart(ttk.Frame):
     def can_reset_zoom(self) -> bool:
         return self.has_samples() and self._zoom_mode != "base"
 
+    def _render_chart_image(self, plot_width: int, point_spacing: float) -> Image.Image:
+        total_width = self._axis_width + plot_width
+        image = Image.new("RGB", (total_width, CHART_HEIGHT), self._palette.chart_bg)
+        draw = ImageDraw.Draw(image)
+        label_font = self._load_font(14, bold=True)
+        tick_font = self._load_font(12)
+        index_font = self._load_font(10)
+
+        draw.rectangle((0, 0, total_width, CHART_HEIGHT), fill=self._palette.chart_bg)
+        zero_y = self._map_y(0.0)
+        draw.text((4, zero_y - 7), "dBm", fill=self._palette.text, font=label_font)
+        for tick in range(int(Y_MAX_DBM), int(Y_MIN_DBM) - 1, -5):
+            y = self._map_y(float(tick))
+            tick_text = str(tick)
+            text_bbox = draw.textbbox((0, 0), tick_text, font=tick_font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+            draw.text((self._axis_width - 6 - text_width, y - text_height / 2), tick_text, fill=self._palette.text, font=tick_font)
+            color = self._palette.grid_major if tick % 10 == 0 else self._palette.grid_minor
+            draw.line((self._axis_width, y, self._axis_width + plot_width, y), fill=color, width=1)
+
+        plot_bottom = CHART_HEIGHT - self._bottom_padding
+        total_columns = len(self._samples)
+        visible_columns = max(1, int((plot_width - self._left_padding * 2) / max(1.0, point_spacing)))
+        label_step = max(1, int(ceil(28.0 / max(1.0, point_spacing))))
+        for index in range(visible_columns + 1):
+            x = self._axis_width + int(round(self._left_padding + index * point_spacing))
+            color = self._palette.grid_major if index % 5 == 0 else self._palette.grid_minor
+            draw.line((x, self._top_padding, x, plot_bottom), fill=color, width=1)
+            if total_columns > 0 and index < total_columns and index % label_step == 0:
+                index_text = str(index)
+                text_bbox = draw.textbbox((0, 0), index_text, font=index_font)
+                text_width = text_bbox[2] - text_bbox[0]
+                draw.text((x - text_width / 2, plot_bottom + 6), index_text, fill=self._palette.text, font=index_font)
+
+        draw.rectangle(
+            (
+                self._axis_width + self._left_padding,
+                self._top_padding,
+                self._axis_width + plot_width - self._left_padding,
+                plot_bottom,
+            ),
+            outline=self._palette.chart_border,
+            width=1,
+        )
+
+        if len(self._samples) > 1:
+            points: list[float] = []
+            for index, dbm_value in enumerate(self._samples):
+                x = self._axis_width + self._left_padding + index * point_spacing
+                points.extend((x, self._map_y(dbm_value)))
+            draw.line(points, fill=self._palette.danger, width=2)
+        elif len(self._samples) == 1:
+            x = self._axis_width + self._left_padding
+            y = self._map_y(self._samples[0])
+            draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=self._palette.danger, outline=self._palette.danger)
+
+        return image
+
+    def _export_fit_spacing(self, width: int) -> float:
+        if len(self._samples) <= 1:
+            return self._base_point_spacing
+
+        usable_width = max(1.0, float(width - self._left_padding * 2))
+        spacing = usable_width / float(len(self._samples) - 1)
+        return min(self._base_point_spacing, spacing)
+
+    def _load_font(self, size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        candidates = (
+            [
+                "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/System/Library/Fonts/Supplemental/Helvetica.ttc",
+            ]
+            if bold
+            else [
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/System/Library/Fonts/Supplemental/Helvetica.ttc",
+            ]
+        )
+        for candidate in candidates:
+            try:
+                return ImageFont.truetype(candidate, size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
     def _draw_axis(self) -> None:
         self._axis_canvas.delete("all")
         zero_y = self._map_y(0.0)
@@ -229,7 +343,7 @@ class SignalChart(ttk.Frame):
             zero_y,
             text="dBm",
             anchor="w",
-            font=("Segoe UI", 7, "bold"),
+            font=("Segoe UI", 10, "bold"),
             fill=self._palette.text,
         )
 
@@ -275,6 +389,8 @@ class SignalChart(ttk.Frame):
         else:
             self._plot_canvas.xview_moveto(0.0)
 
+        self._redraw_hover_value()
+
     def _draw_grid(self, width: int) -> None:
         plot_bottom = CHART_HEIGHT - self._bottom_padding
 
@@ -315,6 +431,13 @@ class SignalChart(ttk.Frame):
         usable_height = CHART_HEIGHT - self._top_padding - self._bottom_padding
         return self._top_padding + ratio * usable_height
 
+    def _map_value_from_y(self, y: float) -> float:
+        usable_height = CHART_HEIGHT - self._top_padding - self._bottom_padding
+        bounded_y = min(max(y, self._top_padding), CHART_HEIGHT - self._bottom_padding)
+        ratio = (bounded_y - self._top_padding) / usable_height
+        value = Y_MAX_DBM - ratio * (Y_MAX_DBM - Y_MIN_DBM)
+        return min(max(value, Y_MIN_DBM), Y_MAX_DBM)
+
     def _x_for_index(self, index: int) -> int:
         return int(round(self._left_padding + index * self._point_spacing))
 
@@ -340,6 +463,176 @@ class SignalChart(ttk.Frame):
             self._point_spacing = self._fit_point_spacing()
         self._redraw()
 
+    def _on_plot_hover(self, event: tk.Event[tk.Misc]) -> None:
+        y = float(event.y)
+        if y < self._top_padding or y > CHART_HEIGHT - self._bottom_padding:
+            self._hide_hover_value()
+            return
+
+        self._hover_x = float(event.x)
+        self._hover_y = y
+        self._redraw_hover_value()
+
+    def _redraw_hover_value(self) -> None:
+        if self._hover_y is None or self._hover_x is None:
+            self._plot_canvas.delete("hover_value")
+            return
+
+        y = self._hover_y
+        value = self._map_value_from_y(y)
+        y_text = f"{value:.2f} dBm"
+        text_x = min(self._hover_x + 12, self._viewport_width() - 8)
+        text_y = max(self._top_padding + 8, min(y - 12, CHART_HEIGHT - self._bottom_padding - 8))
+        self._plot_canvas.delete("hover_value")
+        self._plot_canvas.create_line(
+            0,
+            y,
+            self._viewport_width(),
+            y,
+            fill=self._palette.chart_border,
+            width=1,
+            dash=(2, 4),
+            tags="hover_value",
+        )
+
+        text_id = self._plot_canvas.create_text(
+            text_x,
+            text_y,
+            text=y_text,
+            anchor="sw",
+            font=("Segoe UI", 9, "bold"),
+            fill=self._palette.text,
+            tags="hover_value",
+        )
+        x1, y1, x2, y2 = self._plot_canvas.bbox(text_id)
+        self._plot_canvas.create_rectangle(
+            x1 - 6,
+            y1 - 4,
+            x2 + 6,
+            y2 + 4,
+            fill=self._palette.surface_bg,
+            outline=self._palette.chart_border,
+            tags="hover_value",
+        )
+        self._plot_canvas.tag_raise(text_id)
+
+        sample_index = self._hover_sample_index()
+        if sample_index is None:
+            return
+
+        sample_x = self._x_for_index(sample_index)
+        sample_value = self._samples[sample_index]
+        sample_y = self._map_y(sample_value)
+        self._plot_canvas.create_line(
+            sample_x,
+            self._top_padding,
+            sample_x,
+            CHART_HEIGHT - self._bottom_padding,
+            fill=self._palette.grid_major,
+            width=1,
+            dash=(2, 4),
+            tags="hover_value",
+        )
+        self._plot_canvas.create_oval(
+            sample_x - 4,
+            sample_y - 4,
+            sample_x + 4,
+            sample_y + 4,
+            fill=self._palette.danger,
+            outline=self._palette.selection_fg,
+            width=1,
+            tags="hover_value",
+        )
+        sample_text = f"{sample_value:.2f} dBm"
+        sample_text_x = min(sample_x + 10, self._viewport_width() - 8)
+        sample_text_y = max(self._top_padding + 18, sample_y - 14)
+        sample_text_id = self._plot_canvas.create_text(
+            sample_text_x,
+            sample_text_y,
+            text=sample_text,
+            anchor="sw",
+            font=("Segoe UI", 9, "bold"),
+            fill=self._palette.text,
+            tags="hover_value",
+        )
+        sx1, sy1, sx2, sy2 = self._plot_canvas.bbox(sample_text_id)
+        self._plot_canvas.create_rectangle(
+            sx1 - 6,
+            sy1 - 4,
+            sx2 + 6,
+            sy2 + 4,
+            fill=self._palette.surface_bg,
+            outline=self._palette.chart_border,
+            tags="hover_value",
+        )
+        self._plot_canvas.tag_raise(sample_text_id)
+
+    def _hover_sample_index(self) -> int | None:
+        if self._hover_x is None or not self._samples:
+            return None
+
+        relative_x = self._hover_x - self._left_padding
+        estimated = int(round(relative_x / max(1.0, self._point_spacing)))
+        return min(max(estimated, 0), len(self._samples) - 1)
+
+    def _hide_hover_value(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        self._hover_x = None
+        self._hover_y = None
+        self._plot_canvas.delete("hover_value")
+
+
+class HoverTooltip:
+    def __init__(self, widget: tk.Widget, text_source: callable[[], str], *, delay_ms: int = 250) -> None:
+        self._widget = widget
+        self._text_source = text_source
+        self._delay_ms = delay_ms
+        self._after_id: str | None = None
+        self._tooltip: tk.Toplevel | None = None
+
+        self._widget.bind("<Enter>", self._schedule, add="+")
+        self._widget.bind("<Leave>", self._hide, add="+")
+        self._widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event: tk.Event[tk.Misc]) -> None:
+        self._cancel_pending()
+        self._after_id = self._widget.after(self._delay_ms, self._show)
+
+    def _show(self) -> None:
+        self._after_id = None
+        text = self._text_source().strip()
+        if not text or not self._widget.winfo_viewable():
+            return
+
+        self._tooltip = tk.Toplevel(self._widget)
+        self._tooltip.wm_overrideredirect(True)
+        self._tooltip.attributes("-topmost", True)
+        label = tk.Label(
+            self._tooltip,
+            text=text,
+            bg="#101113",
+            fg="#f5f5f7",
+            padx=8,
+            pady=4,
+            relief="solid",
+            borderwidth=1,
+            font=("Segoe UI", 10),
+        )
+        label.pack()
+        x = self._widget.winfo_rootx() + (self._widget.winfo_width() // 2)
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 8
+        self._tooltip.wm_geometry(f"+{x}+{y}")
+
+    def _hide(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        self._cancel_pending()
+        if self._tooltip is not None:
+            self._tooltip.destroy()
+            self._tooltip = None
+
+    def _cancel_pending(self) -> None:
+        if self._after_id is not None:
+            self._widget.after_cancel(self._after_id)
+            self._after_id = None
+
 
 class RFPowerMeterApp:
     def __init__(self, root: tk.Tk) -> None:
@@ -358,6 +651,7 @@ class RFPowerMeterApp:
 
         self.port_var = tk.StringVar()
         self.connect_button_var = tk.StringVar(value="Connect")
+        self.connect_icon_var = tk.StringVar(value="🔌")
         self.settings_button_var = tk.StringVar(value="Settings")
         self.rate_var = tk.StringVar(value=next(iter(RATE_OPTIONS)))
         self.connection_var = tk.StringVar(value="Disconnected")
@@ -368,6 +662,7 @@ class RFPowerMeterApp:
         self.waveform_var = tk.StringVar(value="Waiting for data")
         self._settings_visible = False
         self._metric_labels: list[tuple[tk.Label, str]] = []
+        self._toolbar_tooltips: list[HoverTooltip] = []
 
         self._build_ui()
         self._apply_theme()
@@ -382,35 +677,37 @@ class RFPowerMeterApp:
 
         toolbar = ttk.Frame(self.root, padding=(12, 12, 12, 0), style="App.TFrame")
         toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.columnconfigure(8, weight=1)
+        toolbar.columnconfigure(4, weight=1)
 
         ttk.Label(toolbar, text="Port").grid(row=0, column=0, sticky="w")
         self.port_combo = ttk.Combobox(toolbar, textvariable=self.port_var, state="readonly", width=14)
         self.port_combo.grid(row=0, column=1, sticky="w", padx=(8, 8))
 
-        self.refresh_ports_button = ttk.Button(
+        self.refresh_ports_button = self._create_toolbar_button(
             toolbar,
-            text="↻",
-            width=3,
-            style="Refresh.TButton",
+            icon="↻",
+            tooltip="Refresh Ports",
             command=self.refresh_ports,
         )
         self.refresh_ports_button.grid(row=0, column=2, sticky="w")
 
-        self.connect_button = ttk.Button(toolbar, textvariable=self.connect_button_var, command=self.toggle_connection)
+        self.connect_button = self._create_toolbar_button(
+            toolbar,
+            textvariable=self.connect_icon_var,
+            tooltip=self.connect_button_var,
+            command=self.toggle_connection,
+        )
         self.connect_button.grid(row=0, column=3, sticky="w", padx=(8, 8))
 
-        self.clear_chart_button = ttk.Button(toolbar, text="Clear Chart", command=self.clear_chart)
-        self.clear_chart_button.grid(row=0, column=4, sticky="w")
-        self.zoom_out_button = ttk.Button(toolbar, text="Zoom Out", command=self.zoom_out_chart)
-        self.zoom_out_button.grid(row=0, column=5, sticky="w", padx=(8, 0))
-        self.zoom_fit_button = ttk.Button(toolbar, text="Zoom to Fit", command=self.zoom_to_fit_chart)
-        self.zoom_fit_button.grid(row=0, column=6, sticky="w", padx=(8, 0))
-        self.reset_zoom_button = ttk.Button(toolbar, text="Reset Zoom", command=self.reset_chart_zoom)
-        self.reset_zoom_button.grid(row=0, column=7, sticky="w", padx=(8, 0))
-        ttk.Button(toolbar, textvariable=self.settings_button_var, command=self.toggle_settings_panel).grid(
+        self.settings_button = self._create_toolbar_button(
+            toolbar,
+            icon="⚙",
+            tooltip=self.settings_button_var,
+            command=self.toggle_settings_panel,
+        )
+        self.settings_button.grid(
             row=0,
-            column=9,
+            column=4,
             sticky="e",
         )
 
@@ -430,13 +727,79 @@ class RFPowerMeterApp:
 
         self._build_metrics(self.left_panel)
 
-        chart_frame = ttk.LabelFrame(self.left_panel, text="Waveform", style="App.TLabelframe")
+        chart_frame = ttk.Frame(self.left_panel, style="App.TFrame")
         chart_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         chart_frame.columnconfigure(0, weight=1)
         chart_frame.rowconfigure(0, weight=1)
 
         self.chart = SignalChart(chart_frame, self._palette)
         self.chart.grid(row=0, column=0, sticky="nsew")
+
+        self.chart_toolbar_overlay = ttk.Frame(chart_frame, style="ChartOverlay.TFrame", padding=4)
+        self.chart_toolbar_overlay.place(relx=1.0, x=-48, y=10, anchor="ne")
+        self.clear_chart_button = self._create_toolbar_button(
+            self.chart_toolbar_overlay,
+            icon="🗑",
+            tooltip="Clear Chart",
+            command=self.clear_chart,
+            width=2,
+            style="ChartToolbar.TButton",
+        )
+        self.clear_chart_button.grid(row=0, column=0, sticky="w")
+        self.load_chart_button = self._create_toolbar_button(
+            self.chart_toolbar_overlay,
+            icon="📂",
+            tooltip="Load Chart",
+            command=self.load_chart,
+            width=2,
+            style="ChartToolbar.TButton",
+        )
+        self.load_chart_button.grid(row=0, column=1, sticky="w", padx=(4, 0))
+        self.save_chart_button = self._create_toolbar_button(
+            self.chart_toolbar_overlay,
+            icon="🗃️",
+            tooltip="Save Chart",
+            command=self.save_chart,
+            width=2,
+            style="ChartToolbar.TButton",
+        )
+        self.save_chart_button.grid(row=0, column=2, sticky="w", padx=(4, 0))
+        self.export_chart_button = self._create_toolbar_button(
+            self.chart_toolbar_overlay,
+            icon="🖼️",
+            tooltip="Export Chart",
+            command=self.export_chart,
+            width=2,
+            style="ChartToolbar.TButton",
+        )
+        self.export_chart_button.grid(row=0, column=3, sticky="w", padx=(4, 0))
+        self.zoom_out_button = self._create_toolbar_button(
+            self.chart_toolbar_overlay,
+            icon="－",
+            tooltip="Zoom Out",
+            command=self.zoom_out_chart,
+            width=2,
+            style="ChartToolbar.TButton",
+        )
+        self.zoom_out_button.grid(row=0, column=4, sticky="w", padx=(4, 0))
+        self.zoom_fit_button = self._create_toolbar_button(
+            self.chart_toolbar_overlay,
+            icon="🔎",
+            tooltip="Zoom to Fit",
+            command=self.zoom_to_fit_chart,
+            width=2,
+            style="ChartToolbar.TButton",
+        )
+        self.zoom_fit_button.grid(row=0, column=5, sticky="w", padx=(4, 0))
+        self.reset_zoom_button = self._create_toolbar_button(
+            self.chart_toolbar_overlay,
+            icon="◎",
+            tooltip="Reset Zoom",
+            command=self.reset_chart_zoom,
+            width=2,
+            style="ChartToolbar.TButton",
+        )
+        self.reset_zoom_button.grid(row=0, column=6, sticky="w", padx=(4, 0))
 
         self._build_controls(self.right_panel)
         self._update_chart_controls_state()
@@ -564,6 +927,29 @@ class RFPowerMeterApp:
         self._metric_labels.append((label, fg_role))
         return label
 
+    def _create_toolbar_button(
+        self,
+        parent: ttk.Frame,
+        *,
+        command: object,
+        tooltip: str | tk.StringVar,
+        icon: str | None = None,
+        textvariable: tk.StringVar | None = None,
+        width: int = 3,
+        style: str = "Toolbar.TButton",
+    ) -> ttk.Button:
+        button = ttk.Button(
+            parent,
+            text=icon,
+            textvariable=textvariable,
+            command=command,
+            width=width,
+            style=style,
+        )
+        tooltip_source = tooltip.get if isinstance(tooltip, tk.StringVar) else (lambda: tooltip)
+        self._toolbar_tooltips.append(HoverTooltip(button, tooltip_source))
+        return button
+
     def _apply_theme(self) -> None:
         style = ttk.Style()
         try:
@@ -581,14 +967,29 @@ class RFPowerMeterApp:
         style.configure("TButton", background=self._palette.surface_bg, foreground=self._palette.text)
         style.map("TButton", background=[("active", self._palette.card_bg), ("disabled", self._palette.surface_bg)])
         style.configure(
-            "Refresh.TButton",
+            "Toolbar.TButton",
             background=self._palette.surface_bg,
             foreground=self._palette.text,
-            font=("Segoe UI Symbol", 20, "bold"),
-            padding=(2, 0),
+            font=("Segoe UI Symbol", 18, "bold"),
+            padding=(2, 2),
+        )
+        style.configure(
+            "ChartToolbar.TButton",
+            background=self._palette.surface_bg,
+            foreground=self._palette.text,
+            font=("Segoe UI Symbol", 12, "bold"),
+            padding=(1, 1),
+            borderwidth=0,
+            relief="flat",
+        )
+        style.configure("ChartOverlay.TFrame", background=self._palette.surface_bg)
+        style.map(
+            "Toolbar.TButton",
+            background=[("active", self._palette.card_bg), ("disabled", self._palette.surface_bg)],
+            foreground=[("disabled", self._palette.muted_text)],
         )
         style.map(
-            "Refresh.TButton",
+            "ChartToolbar.TButton",
             background=[("active", self._palette.card_bg), ("disabled", self._palette.surface_bg)],
             foreground=[("disabled", self._palette.muted_text)],
         )
@@ -682,11 +1083,85 @@ class RFPowerMeterApp:
 
     def clear_chart(self) -> None:
         self.chart.clear()
-        self._max_measurement = None
-        self.max_var.set("--.-dBm")
-        self.max_uw_var.set("--,--uW")
+        self._reset_chart_metrics()
         self._update_chart_controls_state()
         self._append_log("Chart cleared.")
+
+    def save_chart(self) -> None:
+        samples = self.chart.samples()
+        if not samples:
+            messagebox.showinfo("USB RF Power Meter", "There is no chart data to save yet.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save Chart Data",
+            defaultextension=CHART_FILE_EXTENSION,
+            filetypes=[("Chart CSV", "*.csv"), ("All files", "*.*")],
+            initialfile="rf-power-chart.csv",
+        )
+        if not file_path:
+            return
+
+        output = Path(file_path)
+        try:
+            output.write_text(
+                "index,dbm\n" + "\n".join(f"{index},{value:.6f}" for index, value in enumerate(samples)) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            messagebox.showerror("USB RF Power Meter", f"Could not save chart data:\n{exc}")
+            return
+        self._append_log(f"Saved {len(samples)} chart samples to {output}.")
+
+    def load_chart(self) -> None:
+        file_path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Load Chart Data",
+            filetypes=[("Chart CSV", "*.csv"), ("All files", "*.*")],
+        )
+        if not file_path:
+            return
+
+        try:
+            samples = self._read_chart_samples(Path(file_path))
+        except ValueError as exc:
+            messagebox.showerror("USB RF Power Meter", str(exc))
+            return
+        except OSError as exc:
+            messagebox.showerror("USB RF Power Meter", f"Could not read chart data:\n{exc}")
+            return
+
+        self.chart.set_samples(samples)
+        self._restore_loaded_chart_state(samples)
+        self._update_chart_controls_state()
+        self._append_log(f"Loaded {len(samples)} chart samples from {file_path}.")
+
+    def export_chart(self) -> None:
+        if not self.chart.has_samples():
+            messagebox.showinfo("USB RF Power Meter", "There is no chart data to export yet.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export Chart",
+            defaultextension=EXPORT_FILE_EXTENSION,
+            filetypes=[("JPEG image", "*.jpg"), ("All files", "*.*")],
+            initialfile="rf-power-chart.jpg",
+        )
+        if not file_path:
+            return
+
+        try:
+            self.chart.export_to_jpeg(Path(file_path))
+        except subprocess.CalledProcessError as exc:
+            messagebox.showerror("USB RF Power Meter", f"Could not export chart image:\n{exc}")
+            return
+        except OSError as exc:
+            messagebox.showerror("USB RF Power Meter", f"Could not export chart image:\n{exc}")
+            return
+
+        self._append_log(f"Exported chart image to {file_path}.")
 
     def zoom_out_chart(self) -> None:
         self.chart.zoom_out()
@@ -716,6 +1191,52 @@ class RFPowerMeterApp:
             return
         self._worker.send_command(command)
 
+    def _read_chart_samples(self, file_path: Path) -> list[float]:
+        lines = [line.strip() for line in file_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not lines:
+            raise ValueError("The selected chart file is empty.")
+
+        samples: list[float] = []
+        for line in lines:
+            if line.lower() == "index,dbm":
+                continue
+
+            if "," in line:
+                _, dbm_text = line.split(",", 1)
+            else:
+                dbm_text = line
+
+            try:
+                samples.append(float(dbm_text))
+            except ValueError as exc:
+                raise ValueError(f"Invalid chart sample in {file_path.name}: {line}") from exc
+
+        if not samples:
+            raise ValueError("The selected chart file does not contain any samples.")
+        return samples
+
+    def _restore_loaded_chart_state(self, samples: list[float]) -> None:
+        latest_dbm = samples[-1]
+        max_dbm = max(samples)
+        self.dbm_var.set(format_dbm(latest_dbm))
+        self.uw_var.set(format_microwatts(dbm_to_microwatts(latest_dbm)))
+        self.max_var.set(format_dbm(max_dbm))
+        self.max_uw_var.set(format_microwatts(dbm_to_microwatts(max_dbm)))
+        self.waveform_var.set(f"Loaded file with {len(samples)} samples")
+        self._max_measurement = Measurement(
+            raw="loaded-from-file",
+            dbm=max_dbm,
+            microwatts=dbm_to_microwatts(max_dbm),
+        )
+
+    def _reset_chart_metrics(self) -> None:
+        self._max_measurement = None
+        self.max_var.set("--.-dBm")
+        self.max_uw_var.set("--,--uW")
+        self.dbm_var.set("--.-dBm")
+        self.uw_var.set("--,--uW")
+        self.waveform_var.set("Waiting for data")
+
     def _poll_events(self) -> None:
         measurement_batch: list[Measurement] = []
         while True:
@@ -738,6 +1259,7 @@ class RFPowerMeterApp:
             port = str(payload)
             self._connected_port = port
             self.connect_button_var.set("Disconnect")
+            self.connect_icon_var.set("❌")
             self.connection_var.set(f"Connected: {port}")
             self._set_device_controls_connected(True)
             self._append_log(f"Connected to {port}.")
@@ -751,6 +1273,7 @@ class RFPowerMeterApp:
                 self._connected_port = None
             self._worker = None
             self.connect_button_var.set("Connect")
+            self.connect_icon_var.set("🔌")
             self.connection_var.set("Disconnected")
             self._set_device_controls_connected(False)
             self._append_log(f"Disconnected from {port}.")
@@ -759,6 +1282,7 @@ class RFPowerMeterApp:
         if event_type == "error":
             self._append_log(str(payload))
             self.connect_button_var.set("Connect")
+            self.connect_icon_var.set("🔌")
             self.connection_var.set("Error")
             self._set_device_controls_connected(False)
             return
@@ -829,6 +1353,8 @@ class RFPowerMeterApp:
 
     def _update_chart_controls_state(self) -> None:
         self.clear_chart_button.configure(state="normal" if self.chart.has_samples() else "disabled")
+        self.save_chart_button.configure(state="normal" if self.chart.has_samples() else "disabled")
+        self.export_chart_button.configure(state="normal" if self.chart.has_samples() else "disabled")
         self.zoom_out_button.configure(state="normal" if self.chart.can_zoom_out() else "disabled")
         self.zoom_fit_button.configure(state="normal" if self.chart.can_zoom_to_fit() else "disabled")
         self.reset_zoom_button.configure(state="normal" if self.chart.can_reset_zoom() else "disabled")
