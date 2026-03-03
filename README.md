@@ -2,6 +2,10 @@
 
 Desktop implementation of the USB RF Power Meter control panel and live waveform chart.
 
+100K-10GHZ USB RF power meter -55~+30dBm adjustable attenuation value + Antenna + Attenuator FOR Ham Radio Amplifier
+
+![USB RF Power Meter](USB_RF_Power_Meter.avif)
+
 ## Features
 
 - Refresh available COM ports.
