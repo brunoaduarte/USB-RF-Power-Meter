@@ -648,6 +648,7 @@ class RFPowerMeterApp:
         self._worker: SerialWorker | None = None
         self._connected_port: str | None = None
         self._max_measurement: Measurement | None = None
+        self._port_display_to_device: dict[str, str] = {}
 
         self.port_var = tk.StringVar()
         self.connect_button_var = tk.StringVar(value="Connect")
@@ -1038,26 +1039,36 @@ class RFPowerMeterApp:
         self.root.after(APPEARANCE_POLL_INTERVAL_MS, self._poll_appearance)
 
     def refresh_ports(self) -> None:
-        ports = sorted(port.device for port in list_ports.comports() if port.device not in IGNORED_PORTS)
-        self.port_combo.configure(values=ports)
-        combo_width = max((len(port) for port in ports), default=14)
+        port_infos = sorted(
+            (port for port in list_ports.comports() if port.device not in IGNORED_PORTS),
+            key=lambda port: port.device,
+        )
+        display_ports = [self._format_port_label(port) for port in port_infos]
+        self._port_display_to_device = {
+            display_label: port.device for display_label, port in zip(display_ports, port_infos, strict=False)
+        }
+        self.port_combo.configure(values=display_ports)
+        combo_width = max((len(port) for port in display_ports), default=14) + 2
         self.port_combo.configure(width=combo_width)
-        if ports:
-            if self.port_var.get() not in ports:
-                self.port_var.set(ports[0])
+        if display_ports:
+            if self.port_var.get() not in display_ports:
+                self.port_var.set(display_ports[0])
         else:
             self.port_var.set("")
-        self._append_log(f"Detected ports: {', '.join(ports) if ports else 'none'}")
+        detected_ports = ", ".join(display_ports) if display_ports else "none"
+        self._append_log(f"Detected ports: {detected_ports}")
 
     def connect(self) -> None:
         if self._worker is not None:
             self._append_log("A serial connection is already active.")
             return
 
-        selected_port = self.port_var.get().strip()
-        if not selected_port:
+        selected_label = self.port_var.get().strip()
+        if not selected_label:
             messagebox.showerror("USB RF Power Meter", "Select a COM port before connecting.")
             return
+
+        selected_port = self._port_display_to_device.get(selected_label, selected_label)
 
         self._append_log(f"Opening {selected_port} at 9600 baud.")
         self.connection_var.set(f"Connecting to {selected_port}...")
@@ -1065,6 +1076,13 @@ class RFPowerMeterApp:
         self.refresh_ports_button.configure(state="disabled")
         self._worker = SerialWorker(selected_port, self._event_queue)
         self._worker.start()
+
+    def _format_port_label(self, port: object) -> str:
+        device = getattr(port, "device", "")
+        description = getattr(port, "description", "")
+        if platform.system() == "Windows" and description and description != device and description.lower() != "n/a":
+            return f"{device} - {description}"
+        return device
 
     def disconnect(self) -> None:
         if self._worker is None:
