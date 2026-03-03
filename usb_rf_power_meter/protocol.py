@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-STREAM_PACKET_RE = re.compile(r"a[+-]?\d{3}00\d+uA")
+STREAM_PACKET_RE = re.compile(r"a[+-]?\d{3}\d{5}uA")
 SYNC_RESPONSE_RE = re.compile(r"R(?:\d{4}[+-]\d{2}\.\d)+(?:[A-Z])?")
 SYNC_FIELD_RE = re.compile(r"(\d{4})([+-]\d{2}\.\d)")
 
@@ -23,7 +23,7 @@ class SyncEntry:
 
 def parse_stream_packet(raw: str) -> Measurement:
     text = raw.strip()
-    match = re.fullmatch(r"a(?P<dbm>[+-]?\d{3})00(?P<uw>\d+)uA", text)
+    match = re.fullmatch(r"a(?P<dbm>[+-]?\d{3})(?P<uw>\d{5})uA", text)
     if not match:
         raise ValueError(f"Unsupported stream packet: {raw!r}")
 

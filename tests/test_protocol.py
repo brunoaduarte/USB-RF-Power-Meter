@@ -14,6 +14,12 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(measurement.dbm, -43.3)
         self.assertEqual(measurement.microwatts, 0.04)
 
+    def test_parse_stream_packet_without_fixed_separator(self) -> None:
+        measurement = parse_stream_packet("a-11407113uA")
+        self.assertEqual(measurement.raw, "a-11407113uA")
+        self.assertEqual(measurement.dbm, -11.4)
+        self.assertEqual(measurement.microwatts, 71.13)
+
     def test_parse_sync_response(self) -> None:
         response = "R0006+20.00013+20.00027+20.00040+20.00433+20.00915+20.02450+20.05800+00.05800+00.0"
         entries = parse_sync_response(response)
@@ -44,6 +50,18 @@ class ProtocolTests(unittest.TestCase):
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0][0], "sync")
+
+    def test_parser_handles_back_to_back_stream_packets(self) -> None:
+        parser = SerialProtocolParser()
+        payload = "a-11407113uAa-12505560uAa-14903219uAa-08613789uAa-11007812uAa-11506933uAa-09012427uAa-09211798uAa-19601078uA"
+        events = parser.feed(payload)
+
+        self.assertEqual(len(events), 9)
+        self.assertTrue(all(event[0] == "measurement" for event in events))
+        self.assertEqual(events[0][1].dbm, -11.4)
+        self.assertEqual(events[0][1].microwatts, 71.13)
+        self.assertEqual(events[-1][1].dbm, -19.6)
+        self.assertEqual(events[-1][1].microwatts, 10.78)
 
 
 if __name__ == "__main__":
