@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import platform
 import queue
+import subprocess
 import tkinter as tk
 from tkinter import messagebox, ttk
+from dataclasses import dataclass
 from math import ceil
 
 from serial.tools import list_ports
@@ -18,12 +21,89 @@ CHART_WIDTH = 900
 POLL_INTERVAL_MS = 50
 MAX_DRAWN_SAMPLES_PER_BATCH = 200
 CONNECT_SYNC_DELAY_MS = 500
+APPEARANCE_POLL_INTERVAL_MS = 1500
 RATE_OPTIONS = {
     "S0 - 1s (Slow)": "S0",
     "S1 - 200 ms (Fast)": "S1",
     "S2 - 500 ns (Very fast)": "S2",
 }
 SYNC_COMMAND = "Read"
+IGNORED_PORTS = {
+    "/dev/cu.Bluetooth-Incoming-Port",
+    "/dev/cu.debug-console",
+    "/dev/cu.wlan-debug",
+}
+
+
+@dataclass(frozen=True)
+class AppPalette:
+    window_bg: str
+    surface_bg: str
+    card_bg: str
+    chart_bg: str
+    log_bg: str
+    text: str
+    muted_text: str
+    danger: str
+    grid_major: str
+    grid_minor: str
+    chart_border: str
+    entry_bg: str
+    entry_fg: str
+    selection_bg: str
+    selection_fg: str
+
+
+def is_dark_mode() -> bool:
+    if platform.system() != "Darwin":
+        return False
+
+    result = subprocess.run(
+        ["defaults", "read", "-g", "AppleInterfaceStyle"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0 and result.stdout.strip().lower() == "dark"
+
+
+def build_palette(prefers_dark: bool) -> AppPalette:
+    if prefers_dark:
+        return AppPalette(
+            window_bg="#2f2f31",
+            surface_bg="#343436",
+            card_bg="#3b3b3e",
+            chart_bg="#202124",
+            log_bg="#242528",
+            text="#f5f5f7",
+            muted_text="#d1d1d6",
+            danger="#ff3b30",
+            grid_major="#6a6a6e",
+            grid_minor="#45464a",
+            chart_border="#8a8a8f",
+            entry_bg="#4a4a4d",
+            entry_fg="#f5f5f7",
+            selection_bg="#0a84ff",
+            selection_fg="#ffffff",
+        )
+
+    return AppPalette(
+        window_bg="#ececec",
+        surface_bg="#ececec",
+        card_bg="#f4f4f4",
+        chart_bg="#ffffff",
+        log_bg="#ffffff",
+        text="#111111",
+        muted_text="#4f4f4f",
+        danger="#ff3b30",
+        grid_major="#808080",
+        grid_minor="#c2c2c2",
+        chart_border="#606060",
+        entry_bg="#ffffff",
+        entry_fg="#111111",
+        selection_bg="#0a84ff",
+        selection_fg="#ffffff",
+    )
 
 
 def format_dbm(value: float) -> str:
@@ -35,8 +115,9 @@ def format_microwatts(value: float) -> str:
 
 
 class SignalChart(ttk.Frame):
-    def __init__(self, master: tk.Misc) -> None:
+    def __init__(self, master: tk.Misc, palette: AppPalette) -> None:
         super().__init__(master)
+        self._palette = palette
         self._samples: list[float] = []
         self._axis_width = 54
         self._top_padding = 18
@@ -53,7 +134,7 @@ class SignalChart(ttk.Frame):
             self,
             width=self._axis_width,
             height=CHART_HEIGHT,
-            bg="white",
+            bg=self._palette.chart_bg,
             highlightthickness=0,
         )
         self._axis_canvas.grid(row=0, column=0, sticky="ns")
@@ -62,7 +143,7 @@ class SignalChart(ttk.Frame):
             self,
             width=CHART_WIDTH,
             height=CHART_HEIGHT,
-            bg="white",
+            bg=self._palette.chart_bg,
             highlightthickness=0,
             xscrollincrement=POINT_SPACING,
         )
@@ -73,6 +154,13 @@ class SignalChart(ttk.Frame):
         self._scrollbar.grid(row=1, column=1, sticky="ew")
         self._plot_canvas.configure(xscrollcommand=self._scrollbar.set)
 
+        self._draw_axis()
+        self._redraw()
+
+    def apply_palette(self, palette: AppPalette) -> None:
+        self._palette = palette
+        self._axis_canvas.configure(bg=self._palette.chart_bg)
+        self._plot_canvas.configure(bg=self._palette.chart_bg)
         self._draw_axis()
         self._redraw()
 
@@ -142,6 +230,7 @@ class SignalChart(ttk.Frame):
             text="dBm",
             anchor="w",
             font=("Segoe UI", 7, "bold"),
+            fill=self._palette.text,
         )
 
         for tick in range(int(Y_MAX_DBM), int(Y_MIN_DBM) - 1, -5):
@@ -152,6 +241,7 @@ class SignalChart(ttk.Frame):
                 text=str(tick),
                 anchor="e",
                 font=("Segoe UI", 9),
+                fill=self._palette.text,
             )
 
     def _redraw(self) -> None:
@@ -166,12 +256,19 @@ class SignalChart(ttk.Frame):
             points: list[float] = []
             for index, dbm_value in enumerate(self._samples):
                 points.extend((self._x_for_index(index), self._map_y(dbm_value)))
-            self._plot_canvas.create_line(*points, fill="red", width=2, smooth=False)
+            self._plot_canvas.create_line(*points, fill=self._palette.danger, width=2, smooth=False)
 
         elif len(self._samples) == 1:
             x = self._x_for_index(0)
             y = self._map_y(self._samples[0])
-            self._plot_canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="red", outline="red")
+            self._plot_canvas.create_oval(
+                x - 2,
+                y - 2,
+                x + 2,
+                y + 2,
+                fill=self._palette.danger,
+                outline=self._palette.danger,
+            )
 
         if width > viewport_width:
             self._plot_canvas.xview_moveto(1.0)
@@ -183,7 +280,7 @@ class SignalChart(ttk.Frame):
 
         for tick in range(int(Y_MAX_DBM), int(Y_MIN_DBM) - 1, -5):
             y = self._map_y(float(tick))
-            color = "#808080" if tick % 10 == 0 else "#c2c2c2"
+            color = self._palette.grid_major if tick % 10 == 0 else self._palette.grid_minor
             self._plot_canvas.create_line(0, y, width, y, fill=color)
 
         total_columns = len(self._samples)
@@ -192,7 +289,7 @@ class SignalChart(ttk.Frame):
         label_step = max(1, int(ceil(28.0 / spacing)))
         for index in range(visible_columns + 1):
             x = self._x_for_index(index)
-            color = "#808080" if index % 5 == 0 else "#d0d0d0"
+            color = self._palette.grid_major if index % 5 == 0 else self._palette.grid_minor
             self._plot_canvas.create_line(x, self._top_padding, x, plot_bottom, fill=color)
             if total_columns > 0 and index < total_columns and index % label_step == 0:
                 self._plot_canvas.create_text(
@@ -201,6 +298,7 @@ class SignalChart(ttk.Frame):
                     text=str(index),
                     anchor="n",
                     font=("Segoe UI", 8),
+                    fill=self._palette.text,
                 )
 
         self._plot_canvas.create_rectangle(
@@ -208,7 +306,7 @@ class SignalChart(ttk.Frame):
             self._top_padding,
             width - self._left_padding,
             plot_bottom,
-            outline="#606060",
+            outline=self._palette.chart_border,
         )
 
     def _map_y(self, value: float) -> float:
@@ -249,7 +347,9 @@ class RFPowerMeterApp:
         self.root.title("USB RF Power Meter")
         self.root.geometry("1500x760")
         self.root.minsize(1280, 700)
-        self.root.configure(bg="#ececec")
+        self._dark_mode = is_dark_mode()
+        self._palette = build_palette(self._dark_mode)
+        self.root.configure(bg=self._palette.window_bg)
 
         self._event_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self._worker: SerialWorker | None = None
@@ -267,17 +367,20 @@ class RFPowerMeterApp:
         self.uw_var = tk.StringVar(value="--,--uW")
         self.waveform_var = tk.StringVar(value="Waiting for data")
         self._settings_visible = False
+        self._metric_labels: list[tuple[tk.Label, str]] = []
 
         self._build_ui()
+        self._apply_theme()
         self.refresh_ports()
         self.root.after(POLL_INTERVAL_MS, self._poll_events)
+        self.root.after(APPEARANCE_POLL_INTERVAL_MS, self._poll_appearance)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-        toolbar = ttk.Frame(self.root, padding=(12, 12, 12, 0))
+        toolbar = ttk.Frame(self.root, padding=(12, 12, 12, 0), style="App.TFrame")
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.columnconfigure(8, weight=1)
 
@@ -285,7 +388,13 @@ class RFPowerMeterApp:
         self.port_combo = ttk.Combobox(toolbar, textvariable=self.port_var, state="readonly", width=14)
         self.port_combo.grid(row=0, column=1, sticky="w", padx=(8, 8))
 
-        self.refresh_ports_button = ttk.Button(toolbar, text="⟳", width=3, command=self.refresh_ports)
+        self.refresh_ports_button = ttk.Button(
+            toolbar,
+            text="↻",
+            width=3,
+            style="Refresh.TButton",
+            command=self.refresh_ports,
+        )
         self.refresh_ports_button.grid(row=0, column=2, sticky="w")
 
         self.connect_button = ttk.Button(toolbar, textvariable=self.connect_button_var, command=self.toggle_connection)
@@ -305,28 +414,28 @@ class RFPowerMeterApp:
             sticky="e",
         )
 
-        self.content = ttk.Frame(self.root, padding=12)
+        self.content = ttk.Frame(self.root, padding=12, style="App.TFrame")
         self.content.grid(row=1, column=0, sticky="nsew")
         self.content.columnconfigure(0, weight=1)
         self.content.rowconfigure(0, weight=1)
 
-        self.left_panel = ttk.Frame(self.content)
+        self.left_panel = ttk.Frame(self.content, style="App.TFrame")
         self.left_panel.grid(row=0, column=0, sticky="nsew")
         self.left_panel.columnconfigure(0, weight=1)
         self.left_panel.rowconfigure(1, weight=1)
 
-        self.right_panel = ttk.Frame(self.content, padding=(12, 0, 0, 0))
+        self.right_panel = ttk.Frame(self.content, padding=(12, 0, 0, 0), style="App.TFrame")
         self.right_panel.columnconfigure(0, weight=1)
         self.right_panel.rowconfigure(3, weight=1)
 
         self._build_metrics(self.left_panel)
 
-        chart_frame = ttk.LabelFrame(self.left_panel, text="Waveform")
+        chart_frame = ttk.LabelFrame(self.left_panel, text="Waveform", style="App.TLabelframe")
         chart_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         chart_frame.columnconfigure(0, weight=1)
         chart_frame.rowconfigure(0, weight=1)
 
-        self.chart = SignalChart(chart_frame)
+        self.chart = SignalChart(chart_frame, self._palette)
         self.chart.grid(row=0, column=0, sticky="nsew")
 
         self._build_controls(self.right_panel)
@@ -334,50 +443,47 @@ class RFPowerMeterApp:
         self._set_settings_panel_visible(False)
 
     def _build_metrics(self, parent: ttk.Frame) -> None:
-        metrics = ttk.Frame(parent)
+        metrics = ttk.Frame(parent, style="App.TFrame")
         metrics.grid(row=0, column=0, sticky="ew")
         metrics.columnconfigure(0, weight=1)
         metrics.columnconfigure(1, weight=1)
 
-        dbm_frame = ttk.Frame(metrics, padding=8)
+        dbm_frame = ttk.Frame(metrics, padding=8, style="Card.TFrame")
         dbm_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         dbm_frame.columnconfigure(0, weight=1)
         dbm_frame.columnconfigure(1, weight=0)
-        tk.Label(dbm_frame, text="Power(dBm):", font=("Segoe UI", 15, "bold"), bg="#f4f4f4").grid(
+        self._make_metric_label(dbm_frame, text="Power(dBm):", font=("Segoe UI", 15, "bold")).grid(
             row=0, column=0, sticky="w"
         )
-        tk.Label(dbm_frame, text="MAX", font=("Segoe UI", 13), fg="red", bg="#f4f4f4").grid(
+        self._make_metric_label(dbm_frame, text="MAX", font=("Segoe UI", 13), fg_role="danger").grid(
             row=0, column=1, sticky="e", padx=(16, 0)
         )
-        tk.Label(dbm_frame, textvariable=self.dbm_var, font=("Segoe UI", 28, "bold"), bg="#f4f4f4").grid(
+        self._make_metric_label(dbm_frame, textvariable=self.dbm_var, font=("Segoe UI", 28, "bold")).grid(
             row=1, column=0, sticky="w"
         )
-        tk.Label(dbm_frame, textvariable=self.max_var, font=("Segoe UI", 16, "bold"), fg="red", bg="#f4f4f4").grid(
+        self._make_metric_label(dbm_frame, textvariable=self.max_var, font=("Segoe UI", 16, "bold"), fg_role="danger").grid(
             row=1, column=1, sticky="e", padx=(16, 0)
         )
 
-        uw_frame = ttk.Frame(metrics, padding=8)
+        uw_frame = ttk.Frame(metrics, padding=8, style="Card.TFrame")
         uw_frame.grid(row=0, column=1, sticky="nsew")
         uw_frame.columnconfigure(0, weight=1)
         uw_frame.columnconfigure(1, weight=0)
-        tk.Label(uw_frame, text="Power(W):", font=("Segoe UI", 15, "bold"), bg="#f4f4f4").grid(
+        self._make_metric_label(uw_frame, text="Power(W):", font=("Segoe UI", 15, "bold")).grid(
             row=0, column=0, sticky="w"
         )
-        tk.Label(uw_frame, text="MAX", font=("Segoe UI", 13), fg="red", bg="#f4f4f4").grid(
+        self._make_metric_label(uw_frame, text="MAX", font=("Segoe UI", 13), fg_role="danger").grid(
             row=0, column=1, sticky="e", padx=(16, 0)
         )
-        tk.Label(uw_frame, textvariable=self.uw_var, font=("Segoe UI", 28, "bold"), bg="#f4f4f4").grid(
+        self._make_metric_label(uw_frame, textvariable=self.uw_var, font=("Segoe UI", 28, "bold")).grid(
             row=1, column=0, sticky="w"
         )
-        tk.Label(uw_frame, textvariable=self.max_uw_var, font=("Segoe UI", 16, "bold"), fg="red", bg="#f4f4f4").grid(
+        self._make_metric_label(uw_frame, textvariable=self.max_uw_var, font=("Segoe UI", 16, "bold"), fg_role="danger").grid(
             row=1, column=1, sticky="e", padx=(16, 0)
         )
 
-        for frame in (dbm_frame, uw_frame):
-            frame.configure(style="Card.TFrame")
-
     def _build_controls(self, parent: ttk.Frame) -> None:
-        command_frame = ttk.LabelFrame(parent, text="Device Commands", padding=12)
+        command_frame = ttk.LabelFrame(parent, text="Device Commands", padding=12, style="App.TLabelframe")
         command_frame.grid(row=0, column=0, sticky="ew")
         command_frame.columnconfigure(1, weight=1)
 
@@ -399,7 +505,7 @@ class RFPowerMeterApp:
             pady=(10, 0),
         )
 
-        sync_frame = ttk.LabelFrame(parent, text="Synchronized Profiles", padding=12)
+        sync_frame = ttk.LabelFrame(parent, text="Synchronized Profiles", padding=12, style="App.TLabelframe")
         sync_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         sync_frame.columnconfigure(0, weight=1)
         sync_frame.rowconfigure(0, weight=1)
@@ -420,11 +526,11 @@ class RFPowerMeterApp:
         sync_scrollbar.grid(row=0, column=1, sticky="ns")
         self.sync_table.configure(yscrollcommand=sync_scrollbar.set)
 
-        waveform_frame = ttk.LabelFrame(parent, text="Latest Waveform Packet", padding=12)
+        waveform_frame = ttk.LabelFrame(parent, text="Latest Waveform Packet", padding=12, style="App.TLabelframe")
         waveform_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         ttk.Label(waveform_frame, textvariable=self.waveform_var, font=("Consolas", 12)).pack(anchor="w")
 
-        log_frame = ttk.LabelFrame(parent, text="Message Log", padding=12)
+        log_frame = ttk.LabelFrame(parent, text="Message Log", padding=12, style="App.TLabelframe")
         log_frame.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
@@ -435,13 +541,106 @@ class RFPowerMeterApp:
         log_scrollbar.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_scrollbar.set)
 
-        style = ttk.Style()
-        style.configure("Card.TFrame", background="#f4f4f4")
         self._set_device_controls_connected(False)
 
+    def _make_metric_label(
+        self,
+        parent: tk.Misc,
+        *,
+        font: tuple[str, int] | tuple[str, int, str],
+        fg_role: str = "text",
+        text: str | None = None,
+        textvariable: tk.StringVar | None = None,
+    ) -> tk.Label:
+        foreground = self._palette.danger if fg_role == "danger" else self._palette.text
+        label = tk.Label(
+            parent,
+            text=text,
+            textvariable=textvariable,
+            font=font,
+            bg=self._palette.card_bg,
+            fg=foreground,
+        )
+        self._metric_labels.append((label, fg_role))
+        return label
+
+    def _apply_theme(self) -> None:
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        self.root.configure(bg=self._palette.window_bg)
+        style.configure(".", background=self._palette.window_bg, foreground=self._palette.text)
+        style.configure("App.TFrame", background=self._palette.window_bg)
+        style.configure("Card.TFrame", background=self._palette.card_bg)
+        style.configure("App.TLabelframe", background=self._palette.surface_bg, foreground=self._palette.text)
+        style.configure("App.TLabelframe.Label", background=self._palette.surface_bg, foreground=self._palette.text)
+        style.configure("TLabel", background=self._palette.window_bg, foreground=self._palette.text)
+        style.configure("TButton", background=self._palette.surface_bg, foreground=self._palette.text)
+        style.map("TButton", background=[("active", self._palette.card_bg), ("disabled", self._palette.surface_bg)])
+        style.configure(
+            "Refresh.TButton",
+            background=self._palette.surface_bg,
+            foreground=self._palette.text,
+            font=("Segoe UI Symbol", 20, "bold"),
+            padding=(2, 0),
+        )
+        style.map(
+            "Refresh.TButton",
+            background=[("active", self._palette.card_bg), ("disabled", self._palette.surface_bg)],
+            foreground=[("disabled", self._palette.muted_text)],
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=self._palette.entry_bg,
+            background=self._palette.surface_bg,
+            foreground=self._palette.entry_fg,
+            arrowcolor=self._palette.text,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", self._palette.entry_bg)],
+            selectbackground=[("readonly", self._palette.selection_bg)],
+            selectforeground=[("readonly", self._palette.selection_fg)],
+        )
+        style.configure(
+            "Treeview",
+            background=self._palette.log_bg,
+            fieldbackground=self._palette.log_bg,
+            foreground=self._palette.text,
+        )
+        style.configure("Treeview.Heading", background=self._palette.surface_bg, foreground=self._palette.text)
+
+        for label, fg_role in self._metric_labels:
+            label.configure(
+                bg=self._palette.card_bg,
+                fg=self._palette.danger if fg_role == "danger" else self._palette.text,
+            )
+
+        self.log_text.configure(
+            bg=self._palette.log_bg,
+            fg=self._palette.text,
+            insertbackground=self._palette.text,
+            selectbackground=self._palette.selection_bg,
+            selectforeground=self._palette.selection_fg,
+        )
+        self.chart.apply_palette(self._palette)
+
+    def _poll_appearance(self) -> None:
+        dark_mode = is_dark_mode()
+        if dark_mode != self._dark_mode:
+            self._dark_mode = dark_mode
+            self._palette = build_palette(self._dark_mode)
+            self._apply_theme()
+        self.root.after(APPEARANCE_POLL_INTERVAL_MS, self._poll_appearance)
+
     def refresh_ports(self) -> None:
-        ports = sorted(port.device for port in list_ports.comports())
+        ports = sorted(port.device for port in list_ports.comports() if port.device not in IGNORED_PORTS)
         self.port_combo.configure(values=ports)
+        combo_width = max((len(port) for port in ports), default=14)
+        self.port_combo.configure(width=combo_width)
         if ports:
             if self.port_var.get() not in ports:
                 self.port_var.set(ports[0])
