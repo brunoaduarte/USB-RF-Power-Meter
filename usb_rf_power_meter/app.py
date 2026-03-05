@@ -23,7 +23,7 @@ CHART_HEIGHT = 520
 CHART_WIDTH = 900
 POLL_INTERVAL_MS = 50
 MAX_DRAWN_SAMPLES_PER_BATCH = 200
-CONNECT_SYNC_DELAY_MS = 500
+CONNECT_SYNC_DELAY_MS = 1000
 APPEARANCE_POLL_INTERVAL_MS = 1500
 RATE_OPTIONS = {
     "S0 - 1s (Slow)": "S0",
@@ -31,6 +31,7 @@ RATE_OPTIONS = {
     "S2 - 500 ns (Very fast)": "S2",
 }
 SYNC_COMMAND = "Read"
+SYNC_PROFILE_COMMAND_PREFIXES = "ABCDEFGHI"
 IGNORED_PORTS = {
     "/dev/cu.Bluetooth-Incoming-Port",
     "/dev/cu.debug-console",
@@ -664,6 +665,10 @@ class RFPowerMeterApp:
         self._settings_visible = False
         self._metric_labels: list[tuple[tk.Label, str]] = []
         self._toolbar_tooltips: list[HoverTooltip] = []
+        self._sync_entries: list[SyncEntry] = []
+        self._sync_editor: tk.Entry | None = None
+        self._sync_editor_item_id: str | None = None
+        self._sync_editor_column: str | None = None
 
         self._build_ui()
         self._apply_theme()
@@ -876,15 +881,19 @@ class RFPowerMeterApp:
 
         self.sync_table = ttk.Treeview(
             sync_frame,
-            columns=("frequency", "offset"),
+            columns=("index", "frequency", "offset"),
             show="headings",
             height=10,
         )
+        self.sync_table.heading("index", text="#")
         self.sync_table.heading("frequency", text="Frequency (MHz)")
         self.sync_table.heading("offset", text="Offset (dBm)")
+        self.sync_table.column("index", anchor="center", width=48, stretch=False)
         self.sync_table.column("frequency", anchor="center", width=130)
         self.sync_table.column("offset", anchor="center", width=110)
         self.sync_table.grid(row=0, column=0, sticky="nsew")
+        self.sync_table.bind("<Button-1>", self._on_sync_profile_single_click, add="+")
+        self.sync_table.bind("<Double-1>", self._on_sync_profile_double_click)
 
         sync_scrollbar = ttk.Scrollbar(sync_frame, orient="vertical", command=self.sync_table.yview)
         sync_scrollbar.grid(row=0, column=1, sticky="ns")
@@ -1343,18 +1352,128 @@ class RFPowerMeterApp:
         return sampled
 
     def _update_sync_entries(self, entries: list[SyncEntry]) -> None:
+        self._close_sync_editor()
+        self._sync_entries = list(entries)
         for item_id in self.sync_table.get_children():
             self.sync_table.delete(item_id)
 
-        for entry in entries:
+        for index, entry in enumerate(entries):
             self.sync_table.insert(
                 "",
                 "end",
-                values=(f"{entry.frequency_mhz:04d}", f"{entry.offset_dbm:+.1f}"),
+                values=(str(index), str(entry.frequency_mhz), f"{entry.offset_dbm:+.1f}"),
             )
 
         formatted = ", ".join(f"{entry.frequency_mhz:04d}MHz {entry.offset_dbm:+.1f}dBm" for entry in entries)
         self._append_log(f"< Sync profiles: {formatted}")
+
+    def _on_sync_profile_double_click(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.sync_table.identify_row(event.y)
+        if not item_id:
+            return
+        if self.sync_table.identify_column(event.x) in {"#2", "#3"}:
+            return
+
+        try:
+            row_index = self.sync_table.index(item_id)
+        except (IndexError, tk.TclError):
+            return
+
+        self._send_sync_profile_command(row_index)
+
+    def _on_sync_profile_single_click(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.sync_table.identify_row(event.y)
+        column = self.sync_table.identify_column(event.x)
+        if not item_id or column not in {"#2", "#3"}:
+            self._close_sync_editor()
+            return
+
+        self.root.after_idle(lambda: self._open_sync_editor(item_id, column))
+
+    def _open_sync_editor(self, item_id: str, column: str) -> None:
+        self._close_sync_editor()
+        bbox = self.sync_table.bbox(item_id, column)
+        if not bbox:
+            return
+
+        x, y, width, height = bbox
+        values = self.sync_table.item(item_id, "values")
+        value_index = int(column[1:]) - 1
+        if value_index >= len(values):
+            return
+
+        editor = tk.Entry(
+            self.sync_table,
+            justify="center",
+            relief="solid",
+            borderwidth=1,
+        )
+        editor.insert(0, str(values[value_index]))
+        editor.select_range(0, "end")
+        editor.place(x=x, y=y, width=width, height=height)
+        editor.focus_set()
+        editor.bind("<Return>", lambda _event: self._commit_sync_editor())
+        editor.bind("<Escape>", lambda _event: self._close_sync_editor())
+        editor.bind("<FocusOut>", lambda _event: self._close_sync_editor())
+
+        self._sync_editor = editor
+        self._sync_editor_item_id = item_id
+        self._sync_editor_column = column
+
+    def _commit_sync_editor(self) -> None:
+        if self._sync_editor is None or self._sync_editor_item_id is None or self._sync_editor_column is None:
+            return
+
+        try:
+            row_index = self.sync_table.index(self._sync_editor_item_id)
+            entry = self._sync_entries[row_index]
+        except (IndexError, tk.TclError):
+            self._close_sync_editor()
+            return
+
+        raw_value = self._sync_editor.get().strip()
+        try:
+            if self._sync_editor_column == "#2":
+                entry.frequency_mhz = int(raw_value)
+            elif self._sync_editor_column == "#3":
+                entry.offset_dbm = round(float(raw_value), 1)
+        except ValueError:
+            self._append_log(f"Invalid sync profile value: {raw_value}")
+            self._close_sync_editor()
+            return
+
+        self._update_sync_table_row(row_index)
+        self._send_sync_profile_command(row_index)
+        self._close_sync_editor()
+
+    def _close_sync_editor(self) -> None:
+        if self._sync_editor is not None:
+            self._sync_editor.destroy()
+        self._sync_editor = None
+        self._sync_editor_item_id = None
+        self._sync_editor_column = None
+
+    def _update_sync_table_row(self, row_index: int) -> None:
+        try:
+            item_id = self.sync_table.get_children()[row_index]
+            entry = self._sync_entries[row_index]
+        except IndexError:
+            return
+
+        self.sync_table.item(
+            item_id,
+            values=(str(row_index), str(entry.frequency_mhz), f"{entry.offset_dbm:+.1f}"),
+        )
+
+    def _send_sync_profile_command(self, row_index: int) -> None:
+        try:
+            entry = self._sync_entries[row_index]
+            prefix = SYNC_PROFILE_COMMAND_PREFIXES[row_index]
+        except IndexError:
+            return
+
+        command = f"{prefix}{entry.frequency_mhz:04d}{entry.offset_dbm:+05.1f}"
+        self._send_command(command)
 
     def _append_log(self, message: str) -> None:
         self.log_text.configure(state="normal")
