@@ -272,13 +272,15 @@ class SignalChart(ttk.Frame):
 
         plot_bottom = CHART_HEIGHT - self._bottom_padding
         total_columns = len(self._samples)
-        visible_columns = max(1, int((plot_width - self._left_padding * 2) / max(1.0, point_spacing)))
-        label_step = max(1, int(ceil(28.0 / max(1.0, point_spacing))))
-        for index in range(visible_columns + 1):
+        spacing = max(point_spacing, 1e-9)
+        visible_columns = max(1, int(ceil((plot_width - self._left_padding * 2) / spacing)))
+        grid_columns = max(visible_columns, max(0, total_columns - 1))
+        label_indices = set(self._label_indices(total_columns, spacing))
+        for index in range(grid_columns + 1):
             x = self._axis_width + int(round(self._left_padding + index * point_spacing))
             color = self._palette.grid_major if index % 5 == 0 else self._palette.grid_minor
             draw.line((x, self._top_padding, x, plot_bottom), fill=color, width=1)
-            if total_columns > 0 and index < total_columns and index % label_step == 0:
+            if index in label_indices:
                 index_text = str(index)
                 text_bbox = draw.textbbox((0, 0), index_text, font=index_font)
                 text_width = text_bbox[2] - text_bbox[0]
@@ -401,14 +403,15 @@ class SignalChart(ttk.Frame):
             self._plot_canvas.create_line(0, y, width, y, fill=color)
 
         total_columns = len(self._samples)
-        spacing = max(1.0, self._point_spacing)
-        visible_columns = max(1, int((width - self._left_padding * 2) / spacing))
-        label_step = max(1, int(ceil(28.0 / spacing)))
-        for index in range(visible_columns + 1):
+        spacing = max(self._point_spacing, 1e-9)
+        visible_columns = max(1, int(ceil((width - self._left_padding * 2) / spacing)))
+        grid_columns = max(visible_columns, max(0, total_columns - 1))
+        label_indices = set(self._label_indices(total_columns, spacing))
+        for index in range(grid_columns + 1):
             x = self._x_for_index(index)
             color = self._palette.grid_major if index % 5 == 0 else self._palette.grid_minor
             self._plot_canvas.create_line(x, self._top_padding, x, plot_bottom, fill=color)
-            if total_columns > 0 and index < total_columns and index % label_step == 0:
+            if index in label_indices:
                 self._plot_canvas.create_text(
                     x,
                     plot_bottom + 14,
@@ -439,13 +442,13 @@ class SignalChart(ttk.Frame):
         value = Y_MAX_DBM - ratio * (Y_MAX_DBM - Y_MIN_DBM)
         return min(max(value, Y_MIN_DBM), Y_MAX_DBM)
 
-    def _x_for_index(self, index: int) -> int:
-        return int(round(self._left_padding + index * self._point_spacing))
+    def _x_for_index(self, index: int) -> float:
+        return self._left_padding + index * self._point_spacing
 
     def _total_plot_width(self) -> int:
         if not self._samples:
             return 0
-        return int(round(self._left_padding * 2 + max(1, len(self._samples) - 1) * self._point_spacing))
+        return int(ceil(self._left_padding * 2 + max(1, len(self._samples) - 1) * self._point_spacing))
 
     def _fit_point_spacing(self) -> float:
         if len(self._samples) <= 1:
@@ -459,6 +462,28 @@ class SignalChart(ttk.Frame):
         current_width = self._plot_canvas.winfo_width()
         return current_width if current_width > 1 else CHART_WIDTH
 
+    def _label_indices(self, total_columns: int, point_spacing: float) -> list[int]:
+        if total_columns <= 0:
+            return []
+
+        step = max(1, int(ceil(self._label_min_spacing(total_columns) / point_spacing)))
+        indices = list(range(0, total_columns, step))
+        last_index = total_columns - 1
+        if not indices:
+            return [last_index]
+
+        if indices[-1] != last_index:
+            if (last_index - indices[-1]) * point_spacing < self._label_min_spacing(total_columns):
+                indices[-1] = last_index
+            else:
+                indices.append(last_index)
+
+        return indices
+
+    def _label_min_spacing(self, total_columns: int) -> float:
+        max_digits = len(str(max(0, total_columns - 1)))
+        return max(40.0, max_digits * 7.5 + 18.0)
+
     def _on_plot_resize(self, _event: tk.Event[tk.Misc]) -> None:
         if self._zoom_mode == "fit":
             self._point_spacing = self._fit_point_spacing()
@@ -470,7 +495,7 @@ class SignalChart(ttk.Frame):
             self._hide_hover_value()
             return
 
-        self._hover_x = float(event.x)
+        self._hover_x = float(self._plot_canvas.canvasx(event.x))
         self._hover_y = y
         self._redraw_hover_value()
 
@@ -479,16 +504,23 @@ class SignalChart(ttk.Frame):
             self._plot_canvas.delete("hover_value")
             return
 
+        self._sync_hover_to_pointer()
+        if self._hover_y is None or self._hover_x is None:
+            self._plot_canvas.delete("hover_value")
+            return
+
         y = self._hover_y
         value = self._map_value_from_y(y)
         y_text = f"{value:.2f} dBm"
-        text_x = min(self._hover_x + 12, self._viewport_width() - 8)
+        viewport_left = float(self._plot_canvas.canvasx(0))
+        viewport_right = float(self._plot_canvas.canvasx(self._viewport_width()))
+        text_x = min(self._hover_x + 12, viewport_right - 8)
         text_y = max(self._top_padding + 8, min(y - 12, CHART_HEIGHT - self._bottom_padding - 8))
         self._plot_canvas.delete("hover_value")
         self._plot_canvas.create_line(
-            0,
+            viewport_left,
             y,
-            self._viewport_width(),
+            viewport_right,
             y,
             fill=self._palette.chart_border,
             width=1,
@@ -545,7 +577,7 @@ class SignalChart(ttk.Frame):
             tags="hover_value",
         )
         sample_text = f"{sample_value:.2f} dBm"
-        sample_text_x = min(sample_x + 10, self._viewport_width() - 8)
+        sample_text_x = min(sample_x + 10, viewport_right - 8)
         sample_text_y = max(self._top_padding + 18, sample_y - 14)
         sample_text_id = self._plot_canvas.create_text(
             sample_text_x,
@@ -572,14 +604,55 @@ class SignalChart(ttk.Frame):
         if self._hover_x is None or not self._samples:
             return None
 
-        relative_x = self._hover_x - self._left_padding
-        estimated = int(round(relative_x / max(1.0, self._point_spacing)))
-        return min(max(estimated, 0), len(self._samples) - 1)
+        target_x = min(max(self._hover_x, float(self._left_padding)), float(self._x_for_index(len(self._samples) - 1)))
+        spacing = max(self._point_spacing, 1e-9)
+        relative_x = target_x - self._left_padding
+        continuous_index = relative_x / spacing
+        estimated = int(round(continuous_index))
+        estimated = min(max(estimated, 0), len(self._samples) - 1)
+
+        # When zoomed far out, many samples collapse onto the same pixel.
+        # Resolve hover against the actual rendered x positions, not just the ideal spacing math.
+        search_radius = max(2, int(ceil(1.0 / spacing)) + 1) if spacing < 1.0 else 2
+        start = max(0, estimated - search_radius)
+        end = min(len(self._samples) - 1, estimated + search_radius)
+
+        best_index = estimated
+        best_distance = abs(float(self._x_for_index(estimated)) - target_x)
+        best_continuous_distance = abs(float(estimated) - continuous_index)
+        for candidate in range(start, end + 1):
+            rendered_distance = abs(float(self._x_for_index(candidate)) - target_x)
+            continuous_distance = abs(float(candidate) - continuous_index)
+            if (rendered_distance, continuous_distance) < (best_distance, best_continuous_distance):
+                best_index = candidate
+                best_distance = rendered_distance
+                best_continuous_distance = continuous_distance
+
+        return best_index
 
     def _hide_hover_value(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         self._hover_x = None
         self._hover_y = None
         self._plot_canvas.delete("hover_value")
+
+    def _sync_hover_to_pointer(self) -> None:
+        pointer_x = self._plot_canvas.winfo_pointerx()
+        pointer_y = self._plot_canvas.winfo_pointery()
+        widget_under_pointer = self._plot_canvas.winfo_containing(pointer_x, pointer_y)
+        if widget_under_pointer is not self._plot_canvas:
+            self._hover_x = None
+            self._hover_y = None
+            return
+
+        local_x = float(pointer_x - self._plot_canvas.winfo_rootx())
+        local_y = float(pointer_y - self._plot_canvas.winfo_rooty())
+        if local_y < self._top_padding or local_y > CHART_HEIGHT - self._bottom_padding:
+            self._hover_x = None
+            self._hover_y = None
+            return
+
+        self._hover_x = float(self._plot_canvas.canvasx(local_x))
+        self._hover_y = local_y
 
 
 class HoverTooltip:
