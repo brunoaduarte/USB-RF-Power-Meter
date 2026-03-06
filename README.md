@@ -27,13 +27,12 @@ Desktop implementation of the USB RF Power Meter control panel and live waveform
 Example:
 
 ```text
-a-43300004uA
+a-11407113uA
 ```
 
 - `a`: fixed start marker
-- `-433`: `-43.3 dBm`
-- `00`: fixed marker
-- `004uA`: `0.04 uW`
+- `-114`: `-11.4 dBm`
+- `07113`: `71.13 uW`
 
 ### Synchronize command
 
