@@ -56,9 +56,9 @@ Each profile is parsed as:
 
 ### Refresh rates
 
-- `S0\r\n`: 1 second
-- `S1\r\n`: 200 ms
-- `S2\r\n`: 500 ns
+- `S0\r\n`: Slow (1s)
+- `S1\r\n`: Normal (200 ms)
+- `S2\r\n`: Fast (500 ns)
 
 ## Run
 

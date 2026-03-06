@@ -26,9 +26,9 @@ MAX_DRAWN_SAMPLES_PER_BATCH = 200
 CONNECT_SYNC_DELAY_MS = 1000
 APPEARANCE_POLL_INTERVAL_MS = 1500
 RATE_OPTIONS = {
-    "S0 - 1s (Slow)": "S0",
-    "S1 - 200 ms (Fast)": "S1",
-    "S2 - 500 ns (Very fast)": "S2",
+    "Slow (1s)": "S0",
+    "Normal (200 ms)": "S1",
+    "Fast (500 ns)": "S2",
 }
 SYNC_COMMAND = "Read"
 SYNC_PROFILE_COMMAND_PREFIXES = "ABCDEFGHI"
