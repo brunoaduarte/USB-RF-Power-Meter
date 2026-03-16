@@ -75,3 +75,7 @@ pip install -r requirements.txt
 ```bash
 python main.py
 ```
+
+## Windows Shortcut
+
+Double-click [Run USB RF Power Meter.cmd](Run%20USB%20RF%20Power%20Meter.cmd) to start the app with the configured virtual environment on Windows.
